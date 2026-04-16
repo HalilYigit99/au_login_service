@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+USERNAME_FILE="${USERNAME_FILE:-$SCRIPT_DIR/username.txt}"
+PASSWORD_FILE="${PASSWORD_FILE:-$SCRIPT_DIR/password.txt}"
+CHECK_INTERVAL_SECONDS="${CHECK_INTERVAL_SECONDS:-${INTERVAL_SECONDS:-60}}"
+LOGIN_THRESHOLD_SECONDS="${LOGIN_THRESHOLD_SECONDS:-18000}"
+PING_HOST="${PING_HOST:-internet.amasya.edu.tr}"
+NETWORK_RETRY_SECONDS="${NETWORK_RETRY_SECONDS:-15}"
+BASE_URL="${BASE_URL:-https://internet.amasya.edu.tr:8000}"
+LOGIN_ENDPOINT="${LOGIN_ENDPOINT:-/api/v1/auth/login}"
+CHECK_ENDPOINT="${CHECK_ENDPOINT:-/api/v1/auth/check-ip}"
+LOG_PREFIX="${LOG_PREFIX:-[au-login-keepalive]}"
+
+if [[ ! -f "$USERNAME_FILE" ]]; then
+  echo "$LOG_PREFIX Username file not found: $USERNAME_FILE" >&2
+  exit 1
+fi
+
+if [[ ! -f "$PASSWORD_FILE" ]]; then
+  echo "$LOG_PREFIX Password file not found: $PASSWORD_FILE" >&2
+  exit 1
+fi
+
+if ! [[ "$CHECK_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || [[ "$CHECK_INTERVAL_SECONDS" -lt 60 ]]; then
+  echo "$LOG_PREFIX CHECK_INTERVAL_SECONDS must be an integer >= 60" >&2
+  exit 1
+fi
+
+if ! [[ "$LOGIN_THRESHOLD_SECONDS" =~ ^[0-9]+$ ]] || [[ "$LOGIN_THRESHOLD_SECONDS" -lt 60 ]]; then
+  echo "$LOG_PREFIX LOGIN_THRESHOLD_SECONDS must be an integer >= 60" >&2
+  exit 1
+fi
+
+if ! [[ "$NETWORK_RETRY_SECONDS" =~ ^[0-9]+$ ]] || [[ "$NETWORK_RETRY_SECONDS" -lt 5 ]]; then
+  echo "$LOG_PREFIX NETWORK_RETRY_SECONDS must be an integer >= 5" >&2
+  exit 1
+fi
+
+read_secret_value() {
+  local file_path="$1"
+  tr -d '\r\n' < "$file_path"
+}
+
+escape_json_string() {
+  local raw="$1"
+  raw="${raw//\\/\\\\}"
+  raw="${raw//\"/\\\"}"
+  raw="${raw//$'\n'/}"
+  raw="${raw//$'\r'/}"
+  printf '%s' "$raw"
+}
+
+build_login_payload() {
+  local username password
+  username="$(read_secret_value "$USERNAME_FILE")"
+  password="$(read_secret_value "$PASSWORD_FILE")"
+
+  if [[ -z "$username" || -z "$password" ]]; then
+    echo "$LOG_PREFIX Username/Password value is empty." >&2
+    return 1
+  fi
+
+  printf '{"username":"%s","password":"%s","user_type":"student"}' \
+    "$(escape_json_string "$username")" \
+    "$(escape_json_string "$password")"
+}
+
+run_check_ip_request() {
+  curl -sS "${BASE_URL}${CHECK_ENDPOINT}" \
+    -H 'Accept: application/json, text/plain, */*' \
+    -H 'Accept-Language: tr' \
+    -H 'Connection: keep-alive' \
+    -H 'Origin: https://internet.amasya.edu.tr' \
+    -H 'Referer: https://internet.amasya.edu.tr/' \
+    -H 'Sec-Fetch-Dest: empty' \
+    -H 'Sec-Fetch-Mode: cors' \
+    -H 'Sec-Fetch-Site: same-site' \
+    -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 OPR/130.0.0.0' \
+    -H 'sec-ch-ua: "Chromium";v="146", "Not-A.Brand";v="24", "Opera";v="130"' \
+    -H 'sec-ch-ua-mobile: ?0' \
+    -H 'sec-ch-ua-platform: "Linux"'
+}
+
+run_login() {
+  local payload
+  local now
+
+  now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  # Only run login if connected to AmasyaUniversitesi network
+  if ! is_connected_to_amasya_network; then
+    local ssid
+    ssid="$(get_current_wifi_ssid)"
+    echo "$LOG_PREFIX [$now] Not connected to AmasyaUniversitesi network (connected to: ${ssid:-unknown}). Skipping login."
+    return 0
+  fi
+
+  payload="$(build_login_payload)" || {
+    echo "$LOG_PREFIX [$now] Login payload could not be built." >&2
+    return 1
+  }
+
+  echo "$LOG_PREFIX [$now] Sending login request..."
+
+  if curl -sS "${BASE_URL}${LOGIN_ENDPOINT}" \
+    -H 'Accept: application/json, text/plain, */*' \
+    -H 'Accept-Language: tr' \
+    -H 'Connection: keep-alive' \
+    -H 'Content-Type: application/json' \
+    -H 'Origin: https://internet.amasya.edu.tr' \
+    -H 'Referer: https://internet.amasya.edu.tr/' \
+    -H 'Sec-Fetch-Dest: empty' \
+    -H 'Sec-Fetch-Mode: cors' \
+    -H 'Sec-Fetch-Site: same-site' \
+    -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 OPR/130.0.0.0' \
+    -H 'sec-ch-ua: "Chromium";v="146", "Not-A.Brand";v="24", "Opera";v="130"' \
+    -H 'sec-ch-ua-mobile: ?0' \
+    -H 'sec-ch-ua-platform: "Linux"' \
+    --data-raw "$payload" >/dev/null; then
+    echo "$LOG_PREFIX [$now] Login request completed."
+    # Sync system time after successful login
+    sleep 2
+    sync_system_time
+  else
+    echo "$LOG_PREFIX [$now] Login request failed." >&2
+  fi
+}
+
+run_logout() {
+  local now
+
+  now="$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "$LOG_PREFIX [$now] Sending logout request..."
+
+  if curl -sS "${BASE_URL}/api/v1/auth/logout" \
+    -X POST \
+    -H 'Accept: application/json, text/plain, */*' \
+    -H 'Accept-Language: tr' \
+    -H 'Connection: keep-alive' \
+    -H 'Content-Length: 0' \
+    -H 'Origin: https://internet.amasya.edu.tr' \
+    -H 'Referer: https://internet.amasya.edu.tr/' \
+    -H 'Sec-Fetch-Dest: empty' \
+    -H 'Sec-Fetch-Mode: cors' \
+    -H 'Sec-Fetch-Site: same-site' \
+    -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 OPR/130.0.0.0' \
+    -H 'sec-ch-ua: "Chromium";v="146", "Not-A.Brand";v="24", "Opera";v="130"' \
+    -H 'sec-ch-ua-mobile: ?0' \
+    -H 'sec-ch-ua-platform: "Linux"' >/dev/null; then
+    echo "$LOG_PREFIX [$now] Logout request completed."
+  else
+    echo "$LOG_PREFIX [$now] Logout request failed." >&2
+  fi
+}
+
+sync_system_time() {
+  local now
+  local wifi_ssid
+  local target_host
+  local date_header
+  local parsed_time
+
+  now="$(date '+%Y-%m-%d %H:%M:%S')"
+  
+  # WiFi SSID'i kontrol et
+  wifi_ssid="$(nmcli dev wifi show 2>/dev/null | grep -oP '(?<=SSID: ).*' || echo '')" || true
+
+  if [[ "$wifi_ssid" == "AmasyaUniversitesi" ]]; then
+    target_host="internet.amasya.edu.tr"
+  else
+    target_host="google.com"
+  fi
+
+  echo "$LOG_PREFIX [$now] Syncing system time from ${target_host}..."
+
+  # HTTP Date header'ını al
+  date_header="$(curl -sI "https://${target_host}" 2>/dev/null | grep -i '^date:' | sed 's/^[dD]ate: //' | tr -d '\r')" || true
+
+  if [[ -z "$date_header" ]]; then
+    echo "$LOG_PREFIX [$now] Could not fetch Date header from ${target_host}. Skipping time sync." >&2
+    return 1
+  fi
+
+  # Date header'ını parse et ve sistem zamanını ayarla
+  parsed_time="$(date -d "$date_header" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" || {
+    echo "$LOG_PREFIX [$now] Could not parse Date header: $date_header" >&2
+    return 1
+  }
+
+  echo "$LOG_PREFIX [$now] Setting system time to: ${parsed_time}"
+
+  if sudo timedatectl set-ntp false 2>/dev/null && \
+     sudo timedatectl set-time "$parsed_time" 2>/dev/null; then
+    echo "$LOG_PREFIX [$now] System time synchronized successfully."
+  else
+    echo "$LOG_PREFIX [$now] Failed to set system time. (May require root privileges)" >&2
+    return 1
+  fi
+}
+
+randomize_reconnect_interval() {
+  # 2 saat = 7200 saniye, 5 saat = 18000 saniye
+  local min_seconds=7200
+  local max_seconds=18000
+  local random_offset
+
+  random_offset=$((RANDOM % (max_seconds - min_seconds + 1) + min_seconds))
+  NEXT_RECONNECT_TIME=$(($(date +%s) + random_offset))
+
+  local hours=$((random_offset / 3600))
+  local minutes=$((random_offset % 3600 / 60))
+
+  echo "$LOG_PREFIX Random reconnect scheduled in ${hours}h ${minutes}m"
+}
+
+logout_and_login() {
+  run_logout
+  
+  local now
+  now="$(date '+%Y-%m-%d %H:%M:%S')"
+  
+  echo "$LOG_PREFIX [$now] Waiting 2 seconds before login..."
+  sleep 2
+  
+  run_login
+}
+
+extract_timeout() {
+  local response="$1"
+  local timeout
+  timeout="$(sed -nE 's/.*"timeout"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' <<< "$response")"
+
+  if [[ -n "$timeout" ]]; then
+    printf '%s\n' "$timeout"
+  fi
+}
+
+extract_status() {
+  local response="$1"
+  local status
+  status="$(sed -nE 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' <<< "$response")"
+
+  if [[ -n "$status" ]]; then
+    printf '%s\n' "$status"
+  fi
+}
+
+network_ready() {
+  ping -c 1 -W 2 "$PING_HOST" >/dev/null 2>&1
+}
+
+wait_for_network() {
+  local now
+  while ! network_ready; do
+    now="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "$LOG_PREFIX [$now] Network not ready (ping ${PING_HOST} failed). Waiting ${NETWORK_RETRY_SECONDS}s..."
+    sleep "$NETWORK_RETRY_SECONDS"
+  done
+}
+
+get_current_wifi_ssid() {
+  nmcli dev wifi show 2>/dev/null | grep -oP '(?<=SSID: ).*' || echo ""
+}
+
+is_connected_to_amasya_network() {
+  local current_ssid
+  current_ssid="$(get_current_wifi_ssid)"
+  [[ "$current_ssid" == "AmasyaUniversitesi" ]]
+}
+
+manage_tailscaled_service() {
+  local now
+  now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  echo "$LOG_PREFIX [$now] Managing tailscaled service..."
+
+  if systemctl is-active --quiet tailscaled 2>/dev/null; then
+    echo "$LOG_PREFIX [$now] Restarting tailscaled service..."
+    sudo systemctl restart tailscaled 2>/dev/null || {
+      echo "$LOG_PREFIX [$now] Failed to restart tailscaled (may require root privileges)" >&2
+    }
+  else
+    echo "$LOG_PREFIX [$now] Starting tailscaled service..."
+    sudo systemctl start tailscaled 2>/dev/null || {
+      echo "$LOG_PREFIX [$now] Failed to start tailscaled (may require root privileges)" >&2
+    }
+  fi
+
+  sleep 1
+  if systemctl is-active --quiet tailscaled 2>/dev/null; then
+    echo "$LOG_PREFIX [$now] tailscaled service is now active."
+  else
+    echo "$LOG_PREFIX [$now] tailscaled service is not running (may not be installed)" >&2
+  fi
+}
+
+initial_setup() {
+  echo "$LOG_PREFIX Initial setup: syncing time and checking network..."
+
+  sync_system_time
+
+  if is_connected_to_amasya_network; then
+    echo "$LOG_PREFIX Connected to AmasyaUniversitesi network. Performing initial login..."
+    run_login
+  else
+    local ssid
+    ssid="$(get_current_wifi_ssid)"
+    echo "$LOG_PREFIX Not connected to AmasyaUniversitesi network (connected to: ${ssid:-unknown}). Skipping initial login."
+  fi
+
+  manage_tailscaled_service
+  randomize_reconnect_interval
+}
+
+echo "$LOG_PREFIX Starting keepalive loop."
+echo "$LOG_PREFIX Username file: $USERNAME_FILE"
+echo "$LOG_PREFIX Password file: $PASSWORD_FILE"
+echo "$LOG_PREFIX Ping host: $PING_HOST"
+echo "$LOG_PREFIX Check interval: ${CHECK_INTERVAL_SECONDS}s"
+echo "$LOG_PREFIX Login threshold: ${LOGIN_THRESHOLD_SECONDS}s"
+echo "$LOG_PREFIX Network retry: ${NETWORK_RETRY_SECONDS}s"
+
+# Initialize next reconnect time
+NEXT_RECONNECT_TIME=0
+
+echo "$LOG_PREFIX Waiting for network..."
+wait_for_network
+
+initial_setup
+
+while true; do
+  NOW="$(date '+%Y-%m-%d %H:%M:%S')"
+  if ! network_ready; then
+    echo "$LOG_PREFIX [$NOW] Network lost. Waiting until network is reachable..."
+    wait_for_network
+  fi
+
+  echo "$LOG_PREFIX [$NOW] Checking current session status..."
+
+  CHECK_RESPONSE="$(run_check_ip_request 2>/dev/null || true)"
+  STATUS_VALUE="$(extract_status "$CHECK_RESPONSE")"
+  TIMEOUT_VALUE="$(extract_timeout "$CHECK_RESPONSE")"
+
+  if [[ "$STATUS_VALUE" != "active" ]]; then
+    echo "$LOG_PREFIX [$NOW] Session status is '${STATUS_VALUE:-unknown}'. Running login."
+    run_login
+    randomize_reconnect_interval
+  elif [[ -z "$TIMEOUT_VALUE" ]]; then
+    echo "$LOG_PREFIX [$NOW] Timeout could not be parsed. Keeping active session and skipping login."
+  elif [[ "$TIMEOUT_VALUE" -lt 7200 ]]; then
+    echo "$LOG_PREFIX [$NOW] Timeout is ${TIMEOUT_VALUE}s (< 2h). Refreshing session."
+    run_login
+    randomize_reconnect_interval
+  else
+    # Timeout >= 2 saat
+    CURRENT_TIME=$(date +%s)
+    if [[ $CURRENT_TIME -ge $NEXT_RECONNECT_TIME ]]; then
+      echo "$LOG_PREFIX [$NOW] Random reconnect time reached. Timeout is ${TIMEOUT_VALUE}s. Performing random reconnect."
+      logout_and_login
+      randomize_reconnect_interval
+    else
+      SECONDS_UNTIL_RECONNECT=$((NEXT_RECONNECT_TIME - CURRENT_TIME))
+      echo "$LOG_PREFIX [$NOW] Session active, timeout ${TIMEOUT_VALUE}s. Next random reconnect in ${SECONDS_UNTIL_RECONNECT}s."
+    fi
+  fi
+
+  sleep "$CHECK_INTERVAL_SECONDS"
+done
