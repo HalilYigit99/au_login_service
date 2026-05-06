@@ -8,12 +8,60 @@ SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="keepalive.sh"
 USERNAME_FILE="username.txt"
 PASSWORD_FILE="password.txt"
+NETWORK_SERVICE=""
+NETWORK_WAIT_SERVICE=""
 
 print_header() {
   echo
   echo "========================================"
   echo "   ${SERVICE_NAME} service manager"
   echo "========================================"
+}
+
+has_command() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+unit_exists() {
+  local unit_name="$1"
+  systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "$unit_name"
+}
+
+detect_network_units() {
+  NETWORK_SERVICE=""
+  NETWORK_WAIT_SERVICE=""
+
+  if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    NETWORK_SERVICE="NetworkManager.service"
+    if unit_exists "NetworkManager-wait-online.service"; then
+      NETWORK_WAIT_SERVICE="NetworkManager-wait-online.service"
+    fi
+    return
+  fi
+
+  if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+    NETWORK_SERVICE="systemd-networkd.service"
+    if unit_exists "systemd-networkd-wait-online.service"; then
+      NETWORK_WAIT_SERVICE="systemd-networkd-wait-online.service"
+    fi
+    return
+  fi
+
+  # Fallback: active service yoksa kurulu olana gore sec.
+  if unit_exists "NetworkManager.service"; then
+    NETWORK_SERVICE="NetworkManager.service"
+    if unit_exists "NetworkManager-wait-online.service"; then
+      NETWORK_WAIT_SERVICE="NetworkManager-wait-online.service"
+    fi
+    return
+  fi
+
+  if unit_exists "systemd-networkd.service"; then
+    NETWORK_SERVICE="systemd-networkd.service"
+    if unit_exists "systemd-networkd-wait-online.service"; then
+      NETWORK_WAIT_SERVICE="systemd-networkd-wait-online.service"
+    fi
+  fi
 }
 
 require_root() {
@@ -66,6 +114,7 @@ prompt_and_save_credentials() {
 
 install_service() {
   require_root
+  local after_line wants_line
 
   if [[ ! -f "${SCRIPT_SOURCE_DIR}/${RUN_SCRIPT}" ]]; then
     echo "Eksik dosya: ${RUN_SCRIPT}"
@@ -82,12 +131,28 @@ install_service() {
   echo "[3/5] Credential dosyalari /opt altina kaydediliyor..."
   prompt_and_save_credentials "${INSTALL_DIR}"
 
+  detect_network_units
+
+  after_line="After=network-online.target"
+  wants_line="Wants=network-online.target"
+
+  if [[ -n "$NETWORK_SERVICE" ]]; then
+    after_line="After=${NETWORK_SERVICE} network-online.target"
+  fi
+
+  if [[ -n "$NETWORK_WAIT_SERVICE" ]]; then
+    wants_line="Wants=network-online.target ${NETWORK_WAIT_SERVICE}"
+  fi
+
+  echo "Ağ backend secimi: ${NETWORK_SERVICE:-bilinmiyor}"
+  echo "Bekleme servisi: ${NETWORK_WAIT_SERVICE:-yok}"
+
   echo "[4/5] systemd unit yaziliyor: ${UNIT_FILE}"
   cat > "${UNIT_FILE}" <<EOF
 [Unit]
 Description=AU OAuth Login Keepalive Service
-After=NetworkManager.service network-online.target
-Wants=network-online.target NetworkManager-wait-online.service
+${after_line}
+${wants_line}
 
 [Service]
 Type=simple

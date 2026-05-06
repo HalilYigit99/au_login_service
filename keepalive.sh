@@ -12,6 +12,8 @@ BASE_URL="${BASE_URL:-https://internet.amasya.edu.tr:8000}"
 LOGIN_ENDPOINT="${LOGIN_ENDPOINT:-/api/v1/auth/login}"
 CHECK_ENDPOINT="${CHECK_ENDPOINT:-/api/v1/auth/check-ip}"
 LOG_PREFIX="${LOG_PREFIX:-[au-login-keepalive]}"
+NETWORK_BACKEND="unknown"
+NETWORK_BACKEND_REASON="not-detected"
 
 if [[ ! -f "$USERNAME_FILE" ]]; then
   echo "$LOG_PREFIX Username file not found: $USERNAME_FILE" >&2
@@ -41,6 +43,70 @@ fi
 read_secret_value() {
   local file_path="$1"
   tr -d '\r\n' < "$file_path"
+}
+
+has_command() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+detect_network_backend() {
+  local nmcli_available=0
+  local networkctl_available=0
+  local nm_active=0
+  local networkd_active=0
+
+  if has_command nmcli; then
+    nmcli_available=1
+  fi
+
+  if has_command networkctl; then
+    networkctl_available=1
+  fi
+
+  if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    nm_active=1
+  fi
+
+  if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+    networkd_active=1
+  fi
+
+  if [[ "$nm_active" -eq 1 && "$nmcli_available" -eq 1 ]]; then
+    NETWORK_BACKEND="networkmanager"
+    NETWORK_BACKEND_REASON="NetworkManager active"
+  elif [[ "$networkd_active" -eq 1 && "$networkctl_available" -eq 1 ]]; then
+    NETWORK_BACKEND="networkd"
+    NETWORK_BACKEND_REASON="systemd-networkd active"
+  elif [[ "$nmcli_available" -eq 1 ]]; then
+    NETWORK_BACKEND="networkmanager"
+    NETWORK_BACKEND_REASON="nmcli available"
+  elif [[ "$networkctl_available" -eq 1 ]]; then
+    NETWORK_BACKEND="networkd"
+    NETWORK_BACKEND_REASON="networkctl available"
+  else
+    NETWORK_BACKEND="unknown"
+    NETWORK_BACKEND_REASON="neither tool found"
+  fi
+}
+
+get_wireless_interface() {
+  local iface
+
+  if has_command iw; then
+    iface="$(iw dev 2>/dev/null | awk '$1 == "Interface" { print $2; exit }')"
+    if [[ -n "$iface" ]]; then
+      printf '%s\n' "$iface"
+      return 0
+    fi
+  fi
+
+  if has_command networkctl; then
+    iface="$(networkctl --no-legend --no-pager list 2>/dev/null | awk '$2 ~ /^wl/ { print $2; exit }')"
+    if [[ -n "$iface" ]]; then
+      printf '%s\n' "$iface"
+      return 0
+    fi
+  fi
 }
 
 escape_json_string() {
@@ -163,9 +229,9 @@ sync_system_time() {
   local parsed_time
 
   now="$(date '+%Y-%m-%d %H:%M:%S')"
-  
-  # WiFi SSID'i kontrol et
-  wifi_ssid="$(nmcli dev wifi show 2>/dev/null | grep -oP '(?<=SSID: ).*' || echo '')" || true
+
+  # Aktif backend'e gore SSID tespit et.
+  wifi_ssid="$(get_current_wifi_ssid)"
 
   if [[ "$wifi_ssid" == "AmasyaUniversitesi" ]]; then
     target_host="internet.amasya.edu.tr"
@@ -261,7 +327,33 @@ wait_for_network() {
 }
 
 get_current_wifi_ssid() {
-  nmcli dev wifi show 2>/dev/null | grep -oP '(?<=SSID: ).*' || echo ""
+  local ssid=""
+  local wifi_iface=""
+
+  case "$NETWORK_BACKEND" in
+    networkmanager)
+      ssid="$(nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | awk -F: '$1 == "yes" { print $2; exit }')"
+      ;;
+    networkd)
+      if has_command iwgetid; then
+        ssid="$(iwgetid -r 2>/dev/null || true)"
+      fi
+
+      if [[ -z "$ssid" ]] && has_command iw; then
+        wifi_iface="$(get_wireless_interface)"
+        if [[ -n "$wifi_iface" ]]; then
+          ssid="$(iw dev "$wifi_iface" link 2>/dev/null | sed -nE 's/^[[:space:]]*SSID:[[:space:]]*(.*)$/\1/p' | head -n 1)"
+        fi
+      fi
+      ;;
+    *)
+      if has_command iwgetid; then
+        ssid="$(iwgetid -r 2>/dev/null || true)"
+      fi
+      ;;
+  esac
+
+  printf '%s\n' "$ssid"
 }
 
 is_connected_to_amasya_network() {
@@ -321,6 +413,9 @@ echo "$LOG_PREFIX Ping host: $PING_HOST"
 echo "$LOG_PREFIX Check interval: ${CHECK_INTERVAL_SECONDS}s"
 echo "$LOG_PREFIX Login threshold: ${LOGIN_THRESHOLD_SECONDS}s"
 echo "$LOG_PREFIX Network retry: ${NETWORK_RETRY_SECONDS}s"
+
+detect_network_backend
+echo "$LOG_PREFIX Network backend: ${NETWORK_BACKEND} (${NETWORK_BACKEND_REASON})"
 
 # Initialize next reconnect time
 NEXT_RECONNECT_TIME=0
