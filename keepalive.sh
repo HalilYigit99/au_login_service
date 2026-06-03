@@ -14,6 +14,18 @@ CHECK_ENDPOINT="${CHECK_ENDPOINT:-/api/v1/auth/check-ip}"
 LOG_PREFIX="${LOG_PREFIX:-[au-login-keepalive]}"
 NETWORK_BACKEND="unknown"
 NETWORK_BACKEND_REASON="not-detected"
+VPN_ENABLED="${VPN_ENABLED:-false}"
+VPN_SERVER="${VPN_SERVER:-}"
+VPN_PROTOCOL="${VPN_PROTOCOL:-anyconnect}"
+VPN_SERVERCERT="${VPN_SERVERCERT:-}"
+VPN_USERNAME_FILE="${VPN_USERNAME_FILE:-}"
+VPN_PASSWORD_FILE="${VPN_PASSWORD_FILE:-}"
+VPN_PID_FILE="${VPN_PID_FILE:-/run/openconnect-au.pid}"
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "$LOG_PREFIX curl is required but not found. Install curl and retry." >&2
+  exit 1
+fi
 
 if [[ ! -f "$USERNAME_FILE" ]]; then
   echo "$LOG_PREFIX Username file not found: $USERNAME_FILE" >&2
@@ -38,6 +50,21 @@ fi
 if ! [[ "$NETWORK_RETRY_SECONDS" =~ ^[0-9]+$ ]] || [[ "$NETWORK_RETRY_SECONDS" -lt 5 ]]; then
   echo "$LOG_PREFIX NETWORK_RETRY_SECONDS must be an integer >= 5" >&2
   exit 1
+fi
+
+if [[ "$VPN_ENABLED" == "true" ]]; then
+  if [[ -z "$VPN_SERVER" ]]; then
+    echo "$LOG_PREFIX VPN_SERVER must be set when VPN_ENABLED=true" >&2
+    exit 1
+  fi
+  if [[ ! -f "$VPN_USERNAME_FILE" ]]; then
+    echo "$LOG_PREFIX VPN username file not found: $VPN_USERNAME_FILE" >&2
+    exit 1
+  fi
+  if [[ ! -f "$VPN_PASSWORD_FILE" ]]; then
+    echo "$LOG_PREFIX VPN password file not found: $VPN_PASSWORD_FILE" >&2
+    exit 1
+  fi
 fi
 
 read_secret_value() {
@@ -107,6 +134,16 @@ get_wireless_interface() {
       return 0
     fi
   fi
+
+  # Fallback: herhangi bir araç olmadan /sys/class/net/ üzerinden kablosuz arayüz tespiti
+  local net_dir
+  for net_dir in /sys/class/net/*/; do
+    iface="$(basename "$net_dir")"
+    if [[ -d "${net_dir}wireless" ]] || [[ -d "${net_dir}phy80211" ]]; then
+      printf '%s\n' "$iface"
+      return 0
+    fi
+  done
 }
 
 escape_json_string() {
@@ -163,6 +200,8 @@ run_login() {
     return 0
   fi
 
+  [[ "$VPN_ENABLED" == "true" ]] && disconnect_vpn
+
   payload="$(build_login_payload)" || {
     echo "$LOG_PREFIX [$now] Login payload could not be built." >&2
     return 1
@@ -195,6 +234,8 @@ run_login() {
 }
 
 run_logout() {
+  [[ "$VPN_ENABLED" == "true" ]] && disconnect_vpn
+
   local now
 
   now="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -257,8 +298,8 @@ sync_system_time() {
 
   echo "$LOG_PREFIX [$now] Setting system time to: ${parsed_time}"
 
-  if sudo timedatectl set-ntp false 2>/dev/null && \
-     sudo timedatectl set-time "$parsed_time" 2>/dev/null; then
+  if timedatectl set-ntp false 2>/dev/null && \
+     timedatectl set-time "$parsed_time" 2>/dev/null; then
     echo "$LOG_PREFIX [$now] System time synchronized successfully."
   else
     echo "$LOG_PREFIX [$now] Failed to set system time. (May require root privileges)" >&2
@@ -350,6 +391,13 @@ get_current_wifi_ssid() {
       if has_command iwgetid; then
         ssid="$(iwgetid -r 2>/dev/null || true)"
       fi
+
+      if [[ -z "$ssid" ]] && has_command iw; then
+        wifi_iface="$(get_wireless_interface)"
+        if [[ -n "$wifi_iface" ]]; then
+          ssid="$(iw dev "$wifi_iface" link 2>/dev/null | sed -nE 's/^[[:space:]]*SSID:[[:space:]]*(.*)$/\1/p' | head -n 1)"
+        fi
+      fi
       ;;
   esac
 
@@ -362,6 +410,78 @@ is_connected_to_amasya_network() {
   [[ "$current_ssid" == "AmasyaUniversitesi" ]]
 }
 
+vpn_is_connected() {
+  [[ -f "$VPN_PID_FILE" ]] && kill -0 "$(cat "$VPN_PID_FILE")" 2>/dev/null
+}
+
+connect_vpn() {
+  local now vpn_username vpn_password extra_args
+  now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  if ! has_command openconnect; then
+    echo "$LOG_PREFIX [$now] openconnect not found. Skipping VPN connection." >&2
+    return 1
+  fi
+
+  if vpn_is_connected; then
+    echo "$LOG_PREFIX [$now] VPN already connected (pid: $(cat "$VPN_PID_FILE"))."
+    return 0
+  fi
+
+  vpn_username="$(read_secret_value "$VPN_USERNAME_FILE")"
+  vpn_password="$(read_secret_value "$VPN_PASSWORD_FILE")"
+
+  if [[ -z "$vpn_username" || -z "$vpn_password" ]]; then
+    echo "$LOG_PREFIX [$now] VPN credentials are empty. Skipping." >&2
+    return 1
+  fi
+
+  echo "$LOG_PREFIX [$now] Connecting to VPN: ${VPN_SERVER} (protocol: ${VPN_PROTOCOL})..."
+
+  extra_args=()
+  if [[ -n "$VPN_SERVERCERT" ]]; then
+    extra_args+=("--servercert=${VPN_SERVERCERT}")
+  fi
+
+  if printf '%s\n' "$vpn_password" | openconnect \
+      --user="$vpn_username" \
+      --passwd-on-stdin \
+      --background \
+      --pid-file="$VPN_PID_FILE" \
+      --protocol="$VPN_PROTOCOL" \
+      "${extra_args[@]}" \
+      "$VPN_SERVER" >/dev/null 2>&1; then
+    echo "$LOG_PREFIX [$now] VPN connected."
+  else
+    echo "$LOG_PREFIX [$now] VPN connection failed." >&2
+    return 1
+  fi
+}
+
+disconnect_vpn() {
+  local now
+  now="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  if ! vpn_is_connected; then
+    return 0
+  fi
+
+  echo "$LOG_PREFIX [$now] Disconnecting VPN..."
+  kill "$(cat "$VPN_PID_FILE")" 2>/dev/null || true
+  rm -f "$VPN_PID_FILE"
+  echo "$LOG_PREFIX [$now] VPN disconnected."
+}
+
+manage_vpn() {
+  [[ "$VPN_ENABLED" != "true" ]] && return 0
+
+  if is_connected_to_amasya_network; then
+    connect_vpn
+  else
+    disconnect_vpn
+  fi
+}
+
 manage_tailscaled_service() {
   local now
   now="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -370,12 +490,12 @@ manage_tailscaled_service() {
 
   if systemctl is-active --quiet tailscaled 2>/dev/null; then
     echo "$LOG_PREFIX [$now] Restarting tailscaled service..."
-    sudo systemctl restart tailscaled 2>/dev/null || {
+    systemctl restart tailscaled 2>/dev/null || {
       echo "$LOG_PREFIX [$now] Failed to restart tailscaled (may require root privileges)" >&2
     }
   else
     echo "$LOG_PREFIX [$now] Starting tailscaled service..."
-    sudo systemctl start tailscaled 2>/dev/null || {
+    systemctl start tailscaled 2>/dev/null || {
       echo "$LOG_PREFIX [$now] Failed to start tailscaled (may require root privileges)" >&2
     }
   fi
@@ -396,6 +516,7 @@ initial_setup() {
   if is_connected_to_amasya_network; then
     echo "$LOG_PREFIX Connected to AmasyaUniversitesi network. Performing initial login..."
     run_login
+    manage_vpn
   else
     local ssid
     ssid="$(get_current_wifi_ssid)"
@@ -416,6 +537,11 @@ echo "$LOG_PREFIX Network retry: ${NETWORK_RETRY_SECONDS}s"
 
 detect_network_backend
 echo "$LOG_PREFIX Network backend: ${NETWORK_BACKEND} (${NETWORK_BACKEND_REASON})"
+echo "$LOG_PREFIX VPN enabled: ${VPN_ENABLED}"
+if [[ "$VPN_ENABLED" == "true" ]]; then
+  echo "$LOG_PREFIX VPN server: ${VPN_SERVER}"
+  echo "$LOG_PREFIX VPN protocol: ${VPN_PROTOCOL}"
+fi
 
 # Initialize next reconnect time
 NEXT_RECONNECT_TIME=0
@@ -429,6 +555,7 @@ while true; do
   NOW="$(date '+%Y-%m-%d %H:%M:%S')"
   if ! network_ready; then
     echo "$LOG_PREFIX [$NOW] Network lost. Waiting until network is reachable..."
+    [[ "$VPN_ENABLED" == "true" ]] && disconnect_vpn
     wait_for_network
   fi
 
@@ -460,6 +587,8 @@ while true; do
       echo "$LOG_PREFIX [$NOW] Session active, timeout ${TIMEOUT_VALUE}s. Next random reconnect in ${SECONDS_UNTIL_RECONNECT}s."
     fi
   fi
+
+  [[ "$VPN_ENABLED" == "true" ]] && manage_vpn
 
   sleep "$CHECK_INTERVAL_SECONDS"
 done
