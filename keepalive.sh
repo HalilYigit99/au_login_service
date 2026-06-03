@@ -225,9 +225,8 @@ run_login() {
     -H 'sec-ch-ua-platform: "Linux"' \
     --data-raw "$payload" >/dev/null; then
     echo "$LOG_PREFIX [$now] Login request completed."
-    # Sync system time after successful login
     sleep 2
-    sync_system_time
+    sync_system_time || true
   else
     echo "$LOG_PREFIX [$now] Login request failed." >&2
   fi
@@ -301,6 +300,7 @@ sync_system_time() {
   if timedatectl set-ntp false 2>/dev/null && \
      timedatectl set-time "$parsed_time" 2>/dev/null; then
     echo "$LOG_PREFIX [$now] System time synchronized successfully."
+    timedatectl set-ntp true 2>/dev/null || true
   else
     echo "$LOG_PREFIX [$now] Failed to set system time. (May require root privileges)" >&2
     return 1
@@ -476,7 +476,7 @@ manage_vpn() {
   [[ "$VPN_ENABLED" != "true" ]] && return 0
 
   if is_connected_to_amasya_network; then
-    connect_vpn
+    connect_vpn || true
   else
     disconnect_vpn
   fi
@@ -511,7 +511,7 @@ manage_tailscaled_service() {
 initial_setup() {
   echo "$LOG_PREFIX Initial setup: syncing time and checking network..."
 
-  sync_system_time
+  sync_system_time || true
 
   if is_connected_to_amasya_network; then
     echo "$LOG_PREFIX Connected to AmasyaUniversitesi network. Performing initial login..."
