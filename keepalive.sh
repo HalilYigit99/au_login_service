@@ -373,7 +373,7 @@ get_current_wifi_ssid() {
 
   case "$NETWORK_BACKEND" in
     networkmanager)
-      ssid="$(nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | awk -F: '$1 == "yes" { print $2; exit }')"
+      ssid="$(LC_ALL=C nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | awk -F: '$1 == "yes" { print $2; exit }')"
       ;;
     networkd)
       if has_command iwgetid; then
