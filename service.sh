@@ -215,6 +215,7 @@ install_service() {
 Description=AU OAuth Login Keepalive Service
 ${after_line}
 ${wants_line}
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -222,7 +223,6 @@ WorkingDirectory=${INSTALL_DIR}
 ExecStart=/bin/bash ${INSTALL_DIR}/${RUN_SCRIPT}
 Restart=always
 RestartSec=15
-StartLimitIntervalSec=0
 Environment=CHECK_INTERVAL_SECONDS=60
 Environment=LOGIN_THRESHOLD_SECONDS=18000
 Environment=NETWORK_RETRY_SECONDS=15
